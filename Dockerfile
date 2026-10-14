@@ -38,6 +38,23 @@ COPY packages ./packages
 # Copy vendor for Filament theme CSS
 COPY --from=composer /app/vendor ./vendor
 
+# resources/js/echo.js reads these through import.meta.env, which Vite resolves
+# at BUILD time — the browser bundle carries whatever was set here. A
+# self-hosted deployment has to pass its public Reverb address as build args
+# (docker/compose.prod.yml does), or the Echo client ships with an undefined key
+# and every page throws "You must pass your app key".
+ARG VITE_APP_NAME=Relaticle
+ARG VITE_REVERB_APP_KEY=
+ARG VITE_REVERB_HOST=localhost
+ARG VITE_REVERB_PORT=8080
+ARG VITE_REVERB_SCHEME=http
+
+ENV VITE_APP_NAME=${VITE_APP_NAME} \
+    VITE_REVERB_APP_KEY=${VITE_REVERB_APP_KEY} \
+    VITE_REVERB_HOST=${VITE_REVERB_HOST} \
+    VITE_REVERB_PORT=${VITE_REVERB_PORT} \
+    VITE_REVERB_SCHEME=${VITE_REVERB_SCHEME}
+
 RUN pnpm run build
 
 ###########################################
@@ -99,5 +116,12 @@ ENV AUTORUN_LARAVEL_EVENT_CACHE=true
 ENV AUTORUN_LARAVEL_OPTIMIZE=false
 ENV PHP_OPCACHE_ENABLE=1
 ENV SSL_MODE=off
+
+# Refuse to start, loudly, when a required secret is missing: the guard's exit
+# code aborts the container and the message lands in `docker compose logs`.
+COPY --chmod=755 docker/prod/entrypoint.d/ /etc/entrypoint.d/
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=90s --retries=3 \
+    CMD curl -f http://localhost:8080/up || exit 1
 
 EXPOSE 8080
