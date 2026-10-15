@@ -16,6 +16,9 @@
 .env.backup
 .env.bak*
 .env.production
+# Docker stacks in docker/: compose interpolation files with credentials.
+/docker/.env.dev
+/docker/.env.prod
 .phpactor.json
 .phpunit.result.cache
 /coverage-html/

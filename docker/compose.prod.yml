@@ -1,0 +1,204 @@
+# Relaticle — production stack.
+#
+#   cp docker/.env.prod.example docker/.env.prod     # then fill it in
+#   docker compose -f docker/compose.prod.yml --env-file docker/.env.prod up -d --build
+#
+#   app        the application: php-fpm + nginx (serversideup/php), port 8080
+#              inside the container, published on ${APP_PORT:-80}
+#   horizon    queue workers (laravel/horizon over Redis)
+#   scheduler  php artisan schedule:work
+#   reverb     WebSockets for realtime chat streaming
+#   postgres   PostgreSQL 17, not published on the host
+#   redis      Redis 7, not published on the host, password required
+#
+# The image is the repository's own Dockerfile (target `production`), built
+# locally by default. Set IMAGE=ghcr.io/relaticle/relaticle:latest in
+# docker/.env.prod to run the published image instead (`docker compose pull`),
+# keeping in mind that the Reverb key is compiled into the JavaScript bundle at
+# build time — see docker/README.md.
+#
+# See docker/README.md for TLS, backups and the day-2 commands.
+
+name: relaticle-prod
+
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+# Infrastructure wiring. These override docker/.env.prod, so that file only has
+# to carry application settings and secrets (and no host that only exists
+# inside the compose network).
+x-app-env: &app-env
+  DB_CONNECTION: pgsql
+  DB_HOST: postgres
+  DB_PORT: "5432"
+  REDIS_CLIENT: phpredis
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  CACHE_STORE: redis
+  SESSION_DRIVER: redis
+  QUEUE_CONNECTION: redis
+  FILESYSTEM_DISK: ${FILESYSTEM_DISK:-local}
+  MEDIA_DISK: ${MEDIA_DISK:-local}
+  LOG_CHANNEL: stderr
+  LOG_LEVEL: ${LOG_LEVEL:-warning}
+  PHP_OPCACHE_ENABLE: "1"
+  # REVERB_HOST/PORT/SCHEME stay as the operator set them in .env.prod: that is
+  # the address a browser opens the WebSocket against, and the origin the
+  # Content-Security-Policy allows. Server-side, the app reaches the reverb
+  # container by its service name.
+  BROADCAST_CONNECTION: reverb
+  REVERB_SERVER_HOST: 0.0.0.0
+  REVERB_SERVER_PORT: "8080"
+  BROADCAST_REVERB_HOST: reverb
+  BROADCAST_REVERB_PORT: "8080"
+  BROADCAST_REVERB_SCHEME: http
+  BROADCAST_REVERB_VERIFY: "false"
+
+x-app-service: &app-service
+  image: ${IMAGE:-relaticle-prod:local}
+  restart: unless-stopped
+  env_file:
+    - .env.prod
+  logging: *logging
+  extra_hosts:
+    - host.docker.internal:host-gateway
+
+services:
+  app:
+    <<: *app-service
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      target: production
+      args:
+        # resources/js/echo.js reads these at BUILD time (import.meta.env), so
+        # the public Reverb address has to be baked into the bundle. Changing
+        # REVERB_HOST, REVERB_PORT, REVERB_SCHEME or REVERB_APP_KEY means
+        # rebuilding the image, not only restarting it.
+        VITE_APP_NAME: ${APP_NAME:-Relaticle}
+        VITE_REVERB_APP_KEY: ${REVERB_APP_KEY:?set REVERB_APP_KEY in docker/.env.prod}
+        VITE_REVERB_HOST: ${REVERB_HOST:-localhost}
+        VITE_REVERB_PORT: ${REVERB_PORT:-8080}
+        VITE_REVERB_SCHEME: ${REVERB_SCHEME:-http}
+    environment:
+      <<: *app-env
+      # The image's Laravel automations: migrate, storage:link and the caches.
+      AUTORUN_ENABLED: "true"
+      AUTORUN_LARAVEL_MIGRATION: "true"
+      AUTORUN_LARAVEL_MIGRATION_ISOLATION: "true"
+      AUTORUN_LARAVEL_STORAGE_LINK: "true"
+      AUTORUN_LARAVEL_OPTIMIZE: "false"
+      AUTORUN_LARAVEL_CONFIG_CACHE: "true"
+      AUTORUN_LARAVEL_ROUTE_CACHE: "true"
+      AUTORUN_LARAVEL_VIEW_CACHE: "true"
+      AUTORUN_LARAVEL_EVENT_CACHE: "true"
+    ports:
+      - "${APP_PORT:-80}:8080"
+    volumes:
+      - storage:/var/www/html/storage/app
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/up"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 90s
+
+  horizon:
+    <<: *app-service
+    command: ["php", "/var/www/html/artisan", "horizon"]
+    stop_signal: SIGTERM
+    environment:
+      <<: *app-env
+      AUTORUN_ENABLED: "false"
+    volumes:
+      - storage:/var/www/html/storage/app
+    depends_on:
+      app:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "healthcheck-horizon"]
+      start_period: 15s
+
+  scheduler:
+    <<: *app-service
+    command: ["php", "/var/www/html/artisan", "schedule:work"]
+    stop_signal: SIGTERM
+    environment:
+      <<: *app-env
+      AUTORUN_ENABLED: "false"
+    volumes:
+      - storage:/var/www/html/storage/app
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "healthcheck-schedule"]
+      start_period: 15s
+
+  reverb:
+    <<: *app-service
+    command: ["php", "/var/www/html/artisan", "reverb:start"]
+    stop_signal: SIGTERM
+    environment:
+      <<: *app-env
+      AUTORUN_ENABLED: "false"
+    ports:
+      # The browser connects here. Reverb does not terminate TLS: for
+      # wss://… put a reverse proxy in front and set REVERB_SCHEME=https,
+      # REVERB_PORT=443 in docker/.env.prod, then rebuild the image
+      # (VITE_REVERB_* is baked in).
+      - "${REVERB_PUBLISH_PORT:-8080}:8080"
+    depends_on:
+      app:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "healthcheck-reverb"]
+      start_period: 15s
+
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    logging: *logging
+    environment:
+      POSTGRES_DB: ${DB_DATABASE:-relaticle}
+      POSTGRES_USER: ${DB_USERNAME:-relaticle}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?set DB_PASSWORD in docker/.env.prod}
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME:-relaticle} -d ${DB_DATABASE:-relaticle}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    logging: *logging
+    command: ["redis-server", "--appendonly", "yes", "--requirepass", "${REDIS_PASSWORD:?set REDIS_PASSWORD in docker/.env.prod}"]
+    volumes:
+      - redis:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$$REDIS_PASSWORD\" ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    environment:
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?set REDIS_PASSWORD in docker/.env.prod}
+
+volumes:
+  postgres:
+  redis:
+  storage:

@@ -75,6 +75,12 @@ composer lint
 
 See the [Self-Hosting Guide](https://relaticle.com/docs/self-hosting) for Docker and manual deployment instructions.
 
+[`docker/`](docker/README.md) holds two self-contained Docker stacks —
+`docker/compose.dev.yml` (php-fpm + Vite + Horizon + Reverb + PostgreSQL + Redis
++ Mailpit, live code, xdebug) and `docker/compose.prod.yml` (built from this
+repository's `Dockerfile`, with Reverb wired up) — plus the `Makefile` shortcuts
+for both.
+
 # Internationalization
 
 Relaticle ships English-only in the main repository, but the codebase is fully i18n-ready. Self-host forks can drop a `lang/<locale>/` directory in place to translate the entire app. See [`docs/i18n.md`](docs/i18n.md) for the override workflow and CI guardrails.

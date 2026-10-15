@@ -1,0 +1,249 @@
+# Relaticle — development stack.
+#
+#   cp docker/.env.dev.example docker/.env.dev
+#   docker compose -f docker/compose.dev.yml --env-file docker/.env.dev up -d --build
+#
+#   app        http://localhost:8000   php-fpm + nginx (the application)
+#   vite       http://localhost:5173   Vite dev server (HMR)
+#   reverb     ws://localhost:8080     WebSockets: chat streaming
+#   mailpit    http://localhost:8025   caught mail
+#   horizon    http://localhost:8000/horizon
+#
+# The repository is bind-mounted into every PHP service, so PHP, Blade, JS and
+# CSS edits apply immediately — no rebuild. Rebuild only after changing
+# composer.json, package.json, the Dockerfiles or this file.
+#
+# Nothing here needs the on-disk vendor/ or node_modules/: both live in named
+# volumes, and docker/dev/entrypoint.d/40-relaticle-dev-bootstrap.sh installs
+# them on the first start.
+#
+# See docker/README.md.
+
+name: relaticle-dev
+
+# Shared by every PHP service.
+x-php-env: &php-env
+  APP_ENV: local
+  APP_DEBUG: "true"
+  APP_URL: ${APP_URL:-http://localhost:8000}
+  APP_TIMEZONE: ${APP_TIMEZONE:-UTC}
+  LOG_CHANNEL: stderr
+  LOG_LEVEL: ${LOG_LEVEL:-debug}
+  DB_CONNECTION: pgsql
+  DB_HOST: postgres
+  DB_PORT: "5432"
+  DB_DATABASE: ${DB_DATABASE:-relaticle}
+  DB_USERNAME: ${DB_USERNAME:-relaticle}
+  DB_PASSWORD: ${DB_PASSWORD:-secret}
+  REDIS_CLIENT: phpredis
+  REDIS_HOST: redis
+  REDIS_PORT: "6379"
+  CACHE_STORE: redis
+  SESSION_DRIVER: redis
+  QUEUE_CONNECTION: redis
+  MAIL_MAILER: smtp
+  MAIL_HOST: mailpit
+  MAIL_PORT: "1025"
+  MAIL_FROM_ADDRESS: ${MAIL_FROM_ADDRESS:-hello@example.com}
+  # Reverb. REVERB_HOST/PORT/SCHEME are the public address — the browser opens
+  # the socket there, and the Content-Security-Policy allows it.
+  # BROADCAST_REVERB_* is the address the app containers use to reach the
+  # reverb container over the compose network.
+  BROADCAST_CONNECTION: reverb
+  REVERB_APP_ID: ${REVERB_APP_ID:-relaticle}
+  REVERB_APP_KEY: ${REVERB_APP_KEY:-relaticle-local-key}
+  REVERB_APP_SECRET: ${REVERB_APP_SECRET:-relaticle-local-secret}
+  REVERB_HOST: ${REVERB_HOST:-localhost}
+  REVERB_PORT: ${REVERB_PORT:-8080}
+  REVERB_SCHEME: http
+  REVERB_SERVER_HOST: 0.0.0.0
+  REVERB_SERVER_PORT: "8080"
+  BROADCAST_REVERB_HOST: reverb
+  BROADCAST_REVERB_PORT: "8080"
+  BROADCAST_REVERB_SCHEME: http
+  BROADCAST_REVERB_VERIFY: "false"
+  # Vite: read by the dev server and baked into the bundle by `pnpm run build`.
+  VITE_APP_NAME: ${APP_NAME:-Relaticle}
+  VITE_HOST: ${VITE_HOST:-localhost}
+  VITE_PORT: ${VITE_PORT:-5173}
+  VITE_REVERB_APP_KEY: ${REVERB_APP_KEY:-relaticle-local-key}
+  VITE_REVERB_HOST: ${REVERB_HOST:-localhost}
+  VITE_REVERB_PORT: ${REVERB_PORT:-8080}
+  VITE_REVERB_SCHEME: http
+  # xdebug — see docker/dev/php/zz-xdebug.ini.
+  PHP_XDEBUG_MODE: ${PHP_XDEBUG_MODE:-develop,debug}
+  PHP_XDEBUG_START_WITH_REQUEST: ${PHP_XDEBUG_START_WITH_REQUEST:-trigger}
+  PHP_XDEBUG_CLIENT_HOST: ${PHP_XDEBUG_CLIENT_HOST:-host.docker.internal}
+  PHP_XDEBUG_CLIENT_PORT: ${PHP_XDEBUG_CLIENT_PORT:-9003}
+  PHP_XDEBUG_IDEKEY: ${PHP_XDEBUG_IDEKEY:-VSCODE}
+  # The image's Laravel automations: migrate on start, cache nothing, so that
+  # every edit is picked up without a rebuild.
+  AUTORUN_ENABLED: "true"
+  AUTORUN_LARAVEL_MIGRATION: "true"
+  AUTORUN_LARAVEL_MIGRATION_ISOLATION: "true"
+  AUTORUN_LARAVEL_STORAGE_LINK: "true"
+  AUTORUN_LARAVEL_OPTIMIZE: "false"
+  AUTORUN_LARAVEL_CONFIG_CACHE: "false"
+  AUTORUN_LARAVEL_ROUTE_CACHE: "false"
+  AUTORUN_LARAVEL_VIEW_CACHE: "false"
+  AUTORUN_LARAVEL_EVENT_CACHE: "false"
+
+x-php-service: &php-service
+  image: relaticle-dev:local
+  build:
+    context: ..
+    dockerfile: docker/dev/Dockerfile
+    args:
+      # Keeps files the container creates editable on the host (Linux).
+      WWWUSER: ${WWWUSER:-1000}
+      WWWGROUP: ${WWWGROUP:-1000}
+  working_dir: /var/www/html
+  restart: unless-stopped
+  extra_hosts:
+    # xdebug's client_host default, and anything that expects `host.docker.internal`.
+    - host.docker.internal:host-gateway
+  volumes:
+    - ..:/var/www/html
+    - vendor:/var/www/html/vendor
+    - node_modules:/var/www/html/node_modules
+    - composer_cache:/composer
+
+services:
+  app:
+    <<: *php-service
+    environment:
+      <<: *php-env
+      # Installs vendor/ and node_modules/ (first start), generates APP_KEY.
+      # The other services wait for this one to report healthy.
+      DEV_BOOTSTRAP: "true"
+    ports:
+      - "${APP_PORT:-8000}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      mailpit:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/up"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 60s
+
+  vite:
+    <<: *php-service
+    environment:
+      <<: *php-env
+      DEV_BOOTSTRAP: "false"
+      # The automations are for the app container only.
+      AUTORUN_ENABLED: "false"
+    command: ["pnpm", "run", "dev", "--", "--config", "docker/dev/vite.docker.config.js"]
+    ports:
+      - "${VITE_PORT:-5173}:5173"
+    depends_on:
+      app:
+        condition: service_healthy
+
+  horizon:
+    <<: *php-service
+    environment:
+      <<: *php-env
+      DEV_BOOTSTRAP: "false"
+      AUTORUN_ENABLED: "false"
+    command: ["php", "artisan", "horizon"]
+    stop_signal: SIGTERM
+    depends_on:
+      app:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "healthcheck-horizon"]
+      start_period: 15s
+
+  scheduler:
+    <<: *php-service
+    environment:
+      <<: *php-env
+      DEV_BOOTSTRAP: "false"
+      AUTORUN_ENABLED: "false"
+    command: ["php", "artisan", "schedule:work"]
+    stop_signal: SIGTERM
+    depends_on:
+      app:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "healthcheck-schedule"]
+      start_period: 15s
+
+  reverb:
+    <<: *php-service
+    environment:
+      <<: *php-env
+      DEV_BOOTSTRAP: "false"
+      AUTORUN_ENABLED: "false"
+    command: ["php", "artisan", "reverb:start"]
+    stop_signal: SIGTERM
+    ports:
+      - "${REVERB_PORT:-8080}:8080"
+    depends_on:
+      app:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "healthcheck-reverb"]
+      start_period: 15s
+
+  postgres:
+    # 17, not 18: the production stack pins postgres:17-alpine, and a
+    # development database one major ahead of production is a trap.
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_DATABASE:-relaticle}
+      POSTGRES_USER: ${DB_USERNAME:-relaticle}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-secret}
+    ports:
+      - "${FORWARD_DB_PORT:-5432}:5432"
+    volumes:
+      - postgres:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USERNAME:-relaticle} -d ${DB_DATABASE:-relaticle}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${FORWARD_REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  mailpit:
+    image: axllent/mailpit:latest
+    restart: unless-stopped
+    ports:
+      - "${FORWARD_MAILPIT_DASHBOARD_PORT:-8025}:8025"
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--spider", "http://127.0.0.1:8025/readyz"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres:
+  redis:
+  vendor:
+  node_modules:
+  composer_cache:
